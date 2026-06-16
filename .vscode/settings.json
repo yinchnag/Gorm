@@ -1,0 +1,16 @@
+{
+    "gopls": {
+        "ui.documentation.hoverKind": "FullDocumentation",
+        "ui.documentation.linksInHover": "gopls",
+        "ui.documentation.linkTarget": "pkg.go.dev",
+        "ui.semanticTokens": true,
+        "formatting.gofumpt": true,
+        "analyses": {
+            "composites": false,
+            "structtag": false,
+            "cgocall": false,
+            "unusedparams": false
+        },
+    },
+
+}

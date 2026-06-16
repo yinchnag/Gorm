@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "network",
+            "type": "go",
+            "request": "launch",
+            "mode": "debug",
+            "program": "${workspaceFolder}/gameorm/example/main.go",
+            "env": {
+                "GIN_MODE": "debug"
+            },
+            "args": []
+        }
+    ]
+}
