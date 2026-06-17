@@ -2,6 +2,8 @@ package orm
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
@@ -76,12 +78,13 @@ func (s *TableSchema[T]) Save() {
 	pk := ReadPrimaryKey(s.selfPtr, s.meta.PrimaryField)
 	useGlobal := s.useGlobalStorage()
 
-	// 1. 同步写 Redis 热缓存
+	// 1. 同步写 Redis 热缓存，并清除潜在的 null sentinel
 	rds := getRedisStoreForRoute(useGlobal)
 	hostObj := s.hostInterface()
 	if err := rds.Set(ctx, s.meta.TableName, pk, hostObj); err != nil {
 		fmt.Printf("[gameorm] Save redis error [%s:%v]: %v\n", s.meta.TableName, pk, err)
 	}
+	rds.DelNullSentinel(ctx, s.meta.TableName, pk)
 
 	// 2. 异步入队 MySQL 存盘（不阻塞游戏逻辑）
 	getMySQLStoreForRoute(useGlobal).EnqueueSave(s.meta.TableName, s.meta, s.selfPtr)
@@ -103,22 +106,29 @@ func (s *TableSchema[T]) SaveR() {
 
 // Load 按主键从 Redis 读取对象；Redis 未命中时降级读 MySQL，并回写 Redis。
 // 结果直接写入宿主对象字段（通过指针偏移），无额外分配。
+// 若 MySQL 也无记录，则在 Redis 写入 null sentinel（TTL 60s）防止后续请求反复穿透。
 func (s *TableSchema[T]) Load() error {
 	s.mustInit()
 	ctx := context.Background()
 	pk := ReadPrimaryKey(s.selfPtr, s.meta.PrimaryField)
 	useGlobal := s.useGlobalStorage()
 
-	// 1. 先查 Redis
-	hostObj := s.hostInterface()
 	rds := getRedisStoreForRoute(useGlobal)
+
+	// 1. 先查 Redis hash
+	hostObj := s.hostInterface()
 	if err := rds.Get(ctx, s.meta.TableName, pk, hostObj); err == nil {
 		return nil
 	} else if !IsNotFound(err) {
 		fmt.Printf("[gameorm] Load redis error [%s:%v]: %v\n", s.meta.TableName, pk, err)
 	}
 
-	// 2. Redis 未命中，查 MySQL
+	// 2. 检查 null sentinel：MySQL 已知无此记录，直接返回，不再打穿 MySQL
+	if rds.IsNullSentinel(ctx, s.meta.TableName, pk) {
+		return fmt.Errorf("gameorm: Load [%s:%v] mysql: %w", s.meta.TableName, pk, sql.ErrNoRows)
+	}
+
+	// 3. Redis 未命中，查 MySQL
 	if globalPool == nil {
 		return fmt.Errorf("gameorm: pool not initialized")
 	}
@@ -154,14 +164,16 @@ func (s *TableSchema[T]) loadFromMySQL(ctx context.Context, pk any, rds *RedisSt
 	row := db.QueryRowContext(ctx, query, pk)
 	scanDest, scanTargets := makeScanDest(meta, s.selfPtr)
 	if err := row.Scan(scanDest...); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// MySQL 无此记录，写入 null sentinel 防止缓存击穿
+			rds.SetNullSentinel(ctx, meta.TableName, pk)
+		}
 		return fmt.Errorf("gameorm: Load [%s:%v] mysql: %w", meta.TableName, pk, err)
 	}
 	// 将扫描结果回写到字段
 	writeScanResultsToFields(meta, s.selfPtr, scanTargets)
 	// 回写 Redis
 	hostObj := s.hostInterface()
-	ttl := getRedisStore().pool
-	_ = ttl
 	if err := rds.Set(ctx, meta.TableName, pk, hostObj); err != nil {
 		fmt.Printf("[gameorm] Load redis set-back error: %v\n", err)
 	}

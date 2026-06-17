@@ -123,14 +123,31 @@ func IsNotFound(err error) bool {
 	return err == goredis.Nil
 }
 
+// nullSentinelTTL 是 null sentinel key 的存活时间。
+// MySQL 无记录时写入此 sentinel，让后续 Load() 在 Redis 层短路，避免反复打穿 MySQL。
+const nullSentinelTTL = 60 * time.Second
+
+func nullSentinelKey(tableName string, pk any) string {
+	return fmt.Sprintf("%s:%v:_nil_", tableName, pk)
+}
+
+// SetNullSentinel 在 Redis 中写入"记录不存在"标记。
+func (r *RedisStore) SetNullSentinel(ctx context.Context, tableName string, pk any) {
+	_ = r.pool.SelectRedis(r.useGlobal).Set(ctx, nullSentinelKey(tableName, pk), "1", nullSentinelTTL).Err()
+}
+
+// IsNullSentinel 判断 Redis 中是否存在"记录不存在"标记。
+func (r *RedisStore) IsNullSentinel(ctx context.Context, tableName string, pk any) bool {
+	n, err := r.pool.SelectRedis(r.useGlobal).Exists(ctx, nullSentinelKey(tableName, pk)).Result()
+	return err == nil && n > 0
+}
+
+// DelNullSentinel 删除"记录不存在"标记，在 Save() 写入真实数据时调用。
+func (r *RedisStore) DelNullSentinel(ctx context.Context, tableName string, pk any) {
+	_ = r.pool.SelectRedis(r.useGlobal).Del(ctx, nullSentinelKey(tableName, pk)).Err()
+}
+
 // pointerOf 将任意指针类型转换为 unsafe.Pointer，用于字段偏移运算。
-// 这是整个框架的"魔法入口"：通过 unsafe.Pointer 桥接 reflect 元数据与运行时对象。
 func pointerOf(v any) unsafe.Pointer {
-	// any 的底层布局：[itab *ptr | data *ptr]
-	// 此处利用 Go interface 内存布局直接取 data 指针。
-	type iface struct {
-		_    uintptr
-		data unsafe.Pointer
-	}
-	return (*iface)(unsafe.Pointer(&v)).data
+	return unsafe.Pointer(reflect.ValueOf(v).Pointer())
 }
