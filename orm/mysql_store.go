@@ -3,6 +3,7 @@ package orm
 import (
 	"context"
 	"fmt"
+	"math/bits"
 	"reflect"
 	"strings"
 	"sync"
@@ -53,6 +54,13 @@ func (q *flushQueue) pushIfAbsent(item *pendingItem) {
 		q.items[item.key] = item
 	}
 	q.mu.Unlock()
+}
+
+func (q *flushQueue) empty() bool {
+	q.mu.Lock()
+	e := len(q.items) == 0
+	q.mu.Unlock()
+	return e
 }
 
 func (q *flushQueue) drain() []*pendingItem {
@@ -184,16 +192,44 @@ func (s *MySQLStore) Stop() {
 	s.wg.Wait()
 }
 
+const maxFlushBackoff = 30 * time.Second
+
+// maxBackoffShift 是指数退避的最大位移量，从 maxFlushBackoff 推导，保证 1<<maxBackoffShift 不超过上限。
+// bits.Len64(30)-1 = 4，即最大退避 1<<4 = 16s，两个参数只需维护 maxFlushBackoff 一处。
+var maxBackoffShift = bits.Len64(uint64(maxFlushBackoff/time.Second)) - 1
+
+// worker 每隔 interval 触发一次 flush。
+// MySQL 连续报错时，用指数退避（1s→2s→4s…上限 30s）减少日志刷屏。
+// 停机时循环重试直到队列清空，避免 pushIfAbsent 放回的 item 永久丢失。
 func (s *MySQLStore) worker(idx int, interval time.Duration) {
 	defer s.wg.Done()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+
+	errStreak := 0
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+
 	for {
 		select {
-		case <-ticker.C:
-			s.flush(s.queues[idx])
+		case <-timer.C:
+			hadError := s.flush(s.queues[idx])
+			if hadError {
+				errStreak++
+				backoff := time.Duration(1<<min(errStreak-1, maxBackoffShift)) * time.Second
+				timer.Reset(backoff)
+			} else {
+				errStreak = 0
+				timer.Reset(interval)
+			}
 		case <-s.stopCh:
-			s.flush(s.queues[idx]) // 关闭前最后一次 flush，防丢档
+			// 循环重试直到队列清空：flush 失败的 item 会经 pushIfAbsent 回到队列，
+			// 需要再次 flush，否则 worker 退出后这批数据永久丢失。
+			for i := 0; i < 3; i++ {
+				s.flush(s.queues[idx])
+				if s.queues[idx].empty() {
+					break
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
 			return
 		}
 	}
@@ -202,10 +238,10 @@ func (s *MySQLStore) worker(idx int, interval time.Duration) {
 // flush 批量执行队列内所有 pendingItem 对应的 SQL。
 // 执行失败的条目通过 pushIfAbsent 重新入队，等待下次 tick 重试。
 // 若期间已有更新的快照入队（同 key），旧快照被丢弃，新版本优先——写入顺序不受影响。
-func (s *MySQLStore) flush(q *flushQueue) {
+func (s *MySQLStore) flush(q *flushQueue) (hadError bool) {
 	items := q.drain()
 	if len(items) == 0 {
-		return
+		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -221,8 +257,10 @@ func (s *MySQLStore) flush(q *flushQueue) {
 			fmt.Printf("[gameorm] flush error table=%s pk=%v: %v, will retry next tick\n",
 				item.tableName, item.snapshot[pkIndex(item.meta)], err)
 			q.pushIfAbsent(item)
+			hadError = true
 		}
 	}
+	return
 }
 
 // execUpsert 执行 INSERT ... ON DUPLICATE KEY UPDATE（自动幂等）。
